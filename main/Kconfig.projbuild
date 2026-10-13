@@ -246,6 +246,9 @@ choice BOARD_TYPE
     config BOARD_TYPE_ATK_DNESP32S3
         bool "正点原子DNESP32S3开发板"
         depends on IDF_TARGET_ESP32S3
+    config BOARD_TYPE_LINGXI_DNESP32S3
+        bool "灵犀居家管家 (DNESP32S3 + STM32)"
+        depends on IDF_TARGET_ESP32S3
     config BOARD_TYPE_ATK_DNESP32S3_BOX
         bool "正点原子DNESP32S3-BOX"
         depends on IDF_TARGET_ESP32S3
