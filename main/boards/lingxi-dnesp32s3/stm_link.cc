@@ -6,7 +6,7 @@
 
 #define TAG "StmLink"
 
-static constexpr size_t kMaxPayload = 1024;
+static constexpr size_t kMaxPayload = 2048;
 static constexpr TickType_t kFrameGapTimeout = pdMS_TO_TICKS(50);
 
 uint16_t StmLink::Crc16(const uint8_t* data, size_t len, uint16_t crc) {

@@ -13,6 +13,7 @@
 #include "led/single_led.h"
 #include "mcp_server.h"
 #include "stm_link.h"
+#include "assets/lang_config.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -20,6 +21,9 @@
 #include <driver/spi_common.h>
 #include <wifi_station.h>
 #include <cJSON.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <map>
 
 #define TAG "lingxi_dnesp32s3"
 
@@ -61,6 +65,8 @@ private:
     LcdDisplay* display_;
     XL9555* xl9555_;
     StmLink stm_link_;
+    std::vector<uint8_t> heartbeat_resp_;
+    std::map<std::string, std::string> labels_;   // 设备英文名 -> 中文名
 
     void InitializeI2c() {
         i2c_master_bus_config_t i2c_bus_cfg = {
@@ -153,12 +159,21 @@ private:
         RegisterStateTool();
 
         std::string caps;
-        if (!stm_link_.GetCaps(caps)) {
+        if (stm_link_.GetCaps(caps)) {
+            ESP_LOGI(TAG, "STM32 caps: %s", caps.c_str());
+            RegisterDeviceTools(caps);
+        } else {
             ESP_LOGW(TAG, "STM32 home controller not responding, home device tools not registered");
-            return;
         }
-        ESP_LOGI(TAG, "STM32 caps: %s", caps.c_str());
-        RegisterDeviceTools(caps);
+
+        // 心跳：每 5 秒 PING 一次，STM32 据此在屏幕上显示“AI 在线”
+        xTaskCreate([](void* arg) {
+            auto* self = static_cast<lingxi_dnesp32s3*>(arg);
+            while (true) {
+                vTaskDelay(pdMS_TO_TICKS(5000));
+                self->stm_link_.Request(StmLink::kPing, {}, self->heartbeat_resp_, 300, 1);
+            }
+        }, "stm_heartbeat", 3072, this, 3, nullptr);
     }
 
     void RegisterStateTool() {
@@ -188,6 +203,7 @@ private:
             cJSON* id = cJSON_GetObjectItem(dev, "id");
             cJSON* name = cJSON_GetObjectItem(dev, "name");
             cJSON* desc = cJSON_GetObjectItem(dev, "desc");
+            cJSON* label = cJSON_GetObjectItem(dev, "label");
             cJSON* type = cJSON_GetObjectItem(dev, "type");
             cJSON* min = cJSON_GetObjectItem(dev, "min");
             cJSON* max = cJSON_GetObjectItem(dev, "max");
@@ -199,7 +215,9 @@ private:
             std::string dev_name = name->valuestring;
             bool is_switch = strcmp(type->valuestring, "switch") == 0;
             std::string tool_name = "self.home." + dev_name + ".set";
-            std::string description = std::string(desc->valuestring) + "\n";
+            std::string dev_label = cJSON_IsString(label) ? label->valuestring : dev_name;
+            labels_[dev_name] = dev_label;
+            std::string description = "[" + dev_label + "] " + desc->valuestring + "\n";
             PropertyList props;
             if (is_switch) {
                 description += "Args:\n  `on`: true to turn on, false to turn off.";
@@ -231,19 +249,45 @@ private:
         cJSON_Delete(root);
     }
 
-    // STM32 本地操作（按键等）上报的事件，在屏幕上提示
+    // STM32 主动上报的事件：按键操作在屏幕上提示；自动报警时语音终端同步告警
     void HandleHomeEvent(const std::string& json) {
         cJSON* root = cJSON_Parse(json.c_str());
         if (root == nullptr) {
             return;
         }
+        cJSON* src = cJSON_GetObjectItem(root, "src");
         cJSON* dev = cJSON_GetObjectItem(root, "dev");
+        cJSON* label = cJSON_GetObjectItem(root, "label");
         cJSON* value = cJSON_GetObjectItem(root, "value");
         if (cJSON_IsString(dev) && cJSON_IsNumber(value)) {
-            std::string text = std::string(dev->valuestring) + (value->valueint ? " ON" : " OFF");
-            Application::GetInstance().Schedule([this, text]() {
-                display_->ShowNotification(text);
-            });
+            std::string name = cJSON_IsString(label) ? label->valuestring : dev->valuestring;
+            bool on = value->valueint != 0;
+            bool is_auto = cJSON_IsString(src) && strcmp(src->valuestring, "auto") == 0;
+            bool is_alarm = strcmp(dev->valuestring, "alarm") == 0;
+
+            if (is_auto && is_alarm && on) {
+                cJSON* t = cJSON_GetObjectItem(root, "temperature");
+                cJSON* h = cJSON_GetObjectItem(root, "humidity");
+                bool over_t = cJSON_IsTrue(cJSON_GetObjectItem(root, "over_temp"));
+                bool over_h = cJSON_IsTrue(cJSON_GetObjectItem(root, "over_humi"));
+                std::string msg = over_t && over_h ? "温湿度超限" : (over_t ? "温度过高" : "湿度过高");
+                if (cJSON_IsNumber(t) && cJSON_IsNumber(h)) {
+                    msg += "  " + std::to_string(t->valueint) + "°C / " + std::to_string(h->valueint) + "%";
+                }
+                Application::GetInstance().Schedule([msg]() {
+                    Application::GetInstance().Alert("警告", msg.c_str(), "sad", Lang::Sounds::OGG_EXCLAMATION);
+                });
+            } else if (is_auto && is_alarm) {
+                Application::GetInstance().Schedule([this]() {
+                    Application::GetInstance().DismissAlert();
+                    display_->ShowNotification("温湿度已恢复正常");
+                });
+            } else {
+                std::string text = std::string(is_auto ? "自动：" : "按键：") + name + (on ? " 已开启" : " 已关闭");
+                Application::GetInstance().Schedule([this, text]() {
+                    display_->ShowNotification(text);
+                });
+            }
         }
         cJSON_Delete(root);
     }
